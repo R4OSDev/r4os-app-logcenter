@@ -173,8 +173,8 @@ const App = struct {
         var info: r4os.abi.GuiWindowInfo = .{};
         _ = self.ctx.desk.guiWindowInfo(&info);
         const canvas = r4os.gui.Canvas.init(&self.ctx.draw, info);
-        self.w = clampI32(canvas.w, 760, 1600);
-        self.h = clampI32(canvas.h, 420, 1000);
+        self.w = @max(canvas.w, 760);
+        self.h = @max(canvas.h, 420);
     }
 
     fn reload(self: *App) void {
@@ -1093,8 +1093,4 @@ fn sameIgnoreCase(a: []const u8, b: []const u8) bool {
 
 fn upper(c: u8) u8 {
     return if (c >= 'a' and c <= 'z') c - 32 else c;
-}
-
-fn clampI32(value: i32, min_value: i32, max_value: i32) i32 {
-    return if (value < min_value) min_value else if (value > max_value) max_value else value;
 }
