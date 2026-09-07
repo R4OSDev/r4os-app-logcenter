@@ -137,34 +137,38 @@ const App = struct {
         self.reload();
         self.render();
 
-        var live_counter: u32 = 0;
+        var timers: [1]r4os.Timer = .{.{}};
+        var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &timers);
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
+            if (self.live and !timers[0].active) {
+                if (!timers[0].start(&self.ctx.sys, .{ .value = 1 }, .{ .nanoseconds = 1_000_000_000 }, true)) return -1;
+            } else if (!self.live) timers[0].cancel();
             var dirty = false;
-            var event: r4os.abi.GuiEvent = .{};
-            while (self.ctx.desk.guiPollEvent(&event) > 0) {
-                const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
-                switch (kind) {
-                    .close => return 0,
-                    .resize => {
-                        self.updateMetrics();
-                        dirty = true;
-                    },
-                    .mouse_down => self.handleMouseDown(event.x, event.y),
-                    .mouse_up => self.handleMouseUp(event.x, event.y),
-                    .key_down => self.handleKey(@intCast(event.key & 0xFF)),
-                    else => {},
-                }
+            switch (events.wait(r4os.time_contract.timeoutForever())) {
+                .message => |message| {
+                    if (message == .timer) {
+                        self.reload();
+                        self.render();
+                        continue;
+                    }
+                    const event = message.guiEvent() orelse continue;
+                    const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
+                    switch (kind) {
+                        .close => return 0,
+                        .resize => {
+                            self.updateMetrics();
+                            dirty = true;
+                        },
+                        .mouse_down => self.handleMouseDown(event.x, event.y),
+                        .mouse_up => self.handleMouseUp(event.x, event.y),
+                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        else => {},
+                    }
+                },
+                .failure => |raw| return raw,
+                .timed_out => {},
             }
             if (dirty) self.render();
-            if (self.live) {
-                live_counter +%= 1;
-                if (live_counter >= 35) {
-                    live_counter = 0;
-                    self.reload();
-                    self.render();
-                }
-            }
-            self.ctx.sys.sleepTicks(3);
         }
         return 0;
     }
