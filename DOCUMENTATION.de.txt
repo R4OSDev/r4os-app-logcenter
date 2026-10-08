@@ -10,17 +10,18 @@ Projektstruktur seit 0.51.18:
 
 Build:
 
-    cd Code\System\Software\LogCenter
-    ..\..\..\DevTools\Zig\zig.exe build
+    ./Repositories/Apps/LogCenter/Build.sh
+
+Unter Windows: `Repositories\Apps\LogCenter\Build.bat`.
 
 Ergebnis:
 
-    Code\System\Software\LogCenter\zig-out\LOGCENTER.R4X
+    Artifacts/Modules/LogCenter/bin/LOGCENTER.R4X
 
 Contract:
-- R4XStart-Entry: `logcenter_main`
+- App-Entry: `r4_app_main` (`ENTRY_MODE=app`)
 - App-Klasse: `gui`
-- R4L-Imports: `R4DESK:Query:1`, `R4DRAW:Query:1`
+- Platform-Imports: `R4DESK:Query:1`, `R4DRAW:Query:1`, `R4SYS:Query:1`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\LOGCENTER.R4X`
 
 Console-Export:
