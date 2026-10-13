@@ -48,3 +48,8 @@ LOGCENTER exportiert genau diesen Datensatz aus LOGSVC.
 GUI-klassifizierte Anwendung. Terminal erkennt `/EXPORT` und `/RDPTRACE`
 zusaetzlich kompatibel selbst; der explizite Schalter macht den gewuenschten
 ownergebundenen Ausgabeweg in Skripten und Remote-Abnahmen sichtbar.
+
+0.83.2 / LOGCENTER 0.1.5: Kernel-Bootlog wird ausschliesslich mit
+SPECTRA LOGS BOOT oder SERVICE gelesen. All, Quellenliste und Export in
+LOGCENTER umfassen nur Driver, Protocol, Application, Service, Console,
+Diagnostic und File. SOURCE=BOOTLOG wird als ungueltiger Parameter abgewiesen.

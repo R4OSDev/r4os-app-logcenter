@@ -1,3 +1,4 @@
+const source_view = @import("source_view.zig");
 const r4os = @import("r4os");
 
 const AppApi = struct {
@@ -91,7 +92,7 @@ const App = struct {
             return if (ok) 0 else 1;
         }
         if (argsContain(args, "/EXPORT") or argsContain(args, "EXPORT")) {
-            self.applyConsoleExportArgs(args);
+            if (!self.applyConsoleExportArgs(args)) return 2;
             self.reload();
             const ok = self.exportCurrentView();
             self.printExportStatus();
@@ -110,11 +111,14 @@ const App = struct {
         setZ(self.export_path[0..], rdp_trace_export_path);
     }
 
-    fn applyConsoleExportArgs(self: *App, args: []const u8) void {
+    fn applyConsoleExportArgs(self: *App, args: []const u8) bool {
         var rest = args;
         while (takeToken(rest)) |part| {
             if (argValue(part.token, "SOURCE")) |value| {
-                if (sourceIdFromArg(value)) |source_id| self.selected_source_id = source_id;
+                self.selected_source_id = sourceIdFromArg(value) orelse {
+                    self.ctx.sys.println("LOGCENTER: unknown source; kernel logs use SPECTRA LOGS.");
+                    return false;
+                };
             } else if (argValue(part.token, "MIN")) |value| {
                 if (severityFromArg(value)) |severity| self.severity_min = severity;
             } else if (argValue(part.token, "SEARCH")) |value| {
@@ -124,6 +128,7 @@ const App = struct {
             }
             rest = part.rest;
         }
+        return true;
     }
 
     fn printExportStatus(self: *App) void {
@@ -206,9 +211,18 @@ const App = struct {
             self.setErrorStatus("Source query", source_rc);
             return;
         }
-        self.source_count = @min(@as(usize, source_page.count), self.sources.len);
-        var i: usize = 0;
-        while (i < self.source_count) : (i += 1) self.sources[i] = source_page.sources[i];
+        self.source_count = 0;
+        self.service_status.record_count = 0;
+        self.service_status.total_records = 0;
+        self.service_status.dropped_records = 0;
+        for (source_page.sources[0..@min(@as(usize, source_page.count), source_page.sources.len)]) |source| {
+            if (!source_view.allowed(source.id)) continue;
+            self.sources[self.source_count] = source;
+            self.source_count += 1;
+            self.service_status.record_count += source.stored_records;
+            self.service_status.total_records += source.total_records;
+            self.service_status.dropped_records += source.dropped_records;
+        }
 
         if (self.loadRecords() != r4os.abi.service_api_result_ok) return;
         if (self.record_count == 0 and self.record_start > 0) {
@@ -226,7 +240,7 @@ const App = struct {
     fn loadRecords(self: *App) i32 {
         var query = self.makeRecordQuery();
         var page: r4os.abi.LogServiceRecordPage = .{};
-        const rc = self.ctx.sys.logServiceRecords(&query, &page);
+        const rc = source_view.read(&self.ctx.sys, &query, &page);
         if (rc != r4os.abi.service_api_result_ok) {
             self.setErrorStatus("Record query", rc);
             return rc;
@@ -567,7 +581,7 @@ const App = struct {
         var total_bytes: u64 = 0;
         while (pages < 64) : (pages += 1) {
             var page: r4os.abi.LogServiceExportPage = .{};
-            const rc = self.ctx.sys.logServiceExport(&query, &page);
+            const rc = source_view.exportPage(&self.ctx.sys, &query, &page);
             if (rc != r4os.abi.service_api_result_ok) {
                 self.setErrorStatus("Export", rc);
                 return false;
@@ -611,7 +625,6 @@ const App = struct {
     fn selfTest(self: *App) i32 {
         self.ctx.sys.println("LOGCENTER selftest");
         const fixtures = [_]struct { source: u32, record_type: u8, text: []const u8 }{
-            .{ .source = r4os.abi.log_service_source_bootlog, .record_type = r4os.abi.log_record_type_event, .text = "selftest bootlog event" },
             .{ .source = r4os.abi.log_service_source_driver, .record_type = r4os.abi.log_record_type_status_snapshot, .text = "selftest driver snapshot" },
             .{ .source = r4os.abi.log_service_source_protocol, .record_type = r4os.abi.log_record_type_status_snapshot, .text = "selftest protocol snapshot" },
             .{ .source = r4os.abi.log_service_source_application, .record_type = r4os.abi.log_record_type_event, .text = "selftest application event" },
@@ -630,8 +643,7 @@ const App = struct {
         if (!self.hasAllSources()) return self.fail("sources");
         self.ctx.sys.println("LOGCENTER sources: OK");
         if (self.record_count == 0 or self.total_matches == 0) return self.fail("records");
-        if (!self.queryHasRecords(r4os.abi.log_service_source_bootlog) or
-            !self.queryHasRecords(r4os.abi.log_service_source_driver) or
+        if (!self.queryHasRecords(r4os.abi.log_service_source_driver) or
             !self.queryHasRecords(r4os.abi.log_service_source_protocol) or
             !self.queryHasRecords(r4os.abi.log_service_source_service) or
             !self.queryHasRecords(r4os.abi.log_service_source_console) or
@@ -681,8 +693,7 @@ const App = struct {
     }
 
     fn hasAllSources(self: *const App) bool {
-        return self.hasSource(r4os.abi.log_service_source_bootlog) and
-            self.hasSource(r4os.abi.log_service_source_driver) and
+        return self.hasSource(r4os.abi.log_service_source_driver) and
             self.hasSource(r4os.abi.log_service_source_protocol) and
             self.hasSource(r4os.abi.log_service_source_application) and
             self.hasSource(r4os.abi.log_service_source_service) and
@@ -706,7 +717,7 @@ const App = struct {
             .max_records = r4os.abi.log_service_records_per_page,
         };
         var page: r4os.abi.LogServiceRecordPage = .{};
-        return self.ctx.sys.logServiceRecords(&query, &page) == r4os.abi.service_api_result_ok and page.total_matches > 0;
+        return source_view.read(&self.ctx.sys, &query, &page) == r4os.abi.service_api_result_ok and page.total_matches > 0;
     }
 
     fn fail(self: *App, label: []const u8) i32 {
@@ -893,7 +904,6 @@ fn recordOrigin(record: *const r4os.abi.LogServiceRecord) []const u8 {
 
 fn builtinSourceName(source_id: u32) []const u8 {
     return switch (source_id) {
-        r4os.abi.log_service_source_bootlog => "Bootlog",
         r4os.abi.log_service_source_driver => "Driver",
         r4os.abi.log_service_source_protocol => "Protocol",
         r4os.abi.log_service_source_application => "Application",
@@ -1062,7 +1072,6 @@ fn argValue(token: []const u8, name: []const u8) ?[]const u8 {
 
 fn sourceIdFromArg(value: []const u8) ?u32 {
     if (sameIgnoreCase(value, "ALL") or sameIgnoreCase(value, "ANY")) return r4os.abi.log_service_source_any;
-    if (sameIgnoreCase(value, "BOOTLOG")) return r4os.abi.log_service_source_bootlog;
     if (sameIgnoreCase(value, "DRIVER")) return r4os.abi.log_service_source_driver;
     if (sameIgnoreCase(value, "PROTOCOL")) return r4os.abi.log_service_source_protocol;
     if (sameIgnoreCase(value, "APPLICATION") or sameIgnoreCase(value, "APP")) return r4os.abi.log_service_source_application;
