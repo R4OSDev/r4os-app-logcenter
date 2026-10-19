@@ -79,6 +79,7 @@ const App = struct {
     has_more: bool = false,
     records: [r4os.abi.log_service_records_per_page]r4os.abi.LogServiceRecord = .{r4os.abi.LogServiceRecord{}} ** r4os.abi.log_service_records_per_page,
     export_path: [128]u8 = .{0} ** 128,
+    saver: r4os.document_save.Saver = .{},
 
     fn run(self: *App) i32 {
         setZ(self.export_path[0..], default_export_path);
@@ -98,7 +99,12 @@ const App = struct {
             self.printExportStatus();
             return if (ok) 0 else 1;
         }
-        if (self.ctx.desk.programWindowId() >= 0) return self.runHosted();
+        if (self.ctx.desk.programWindowId() >= 0) {
+            // The normal GUI uses the same source/filter/output selection as
+            // console export, including a caller-selected private destination.
+            if (!self.applyConsoleExportArgs(args)) return 2;
+            return self.runHosted();
+        }
         self.ctx.sys.println("LOGCENTER is a desktop GUI application.");
         self.ctx.sys.println("Use /SELFTEST, /EXPORT or /RDPTRACE for console mode.");
         return 0;
@@ -574,43 +580,40 @@ const App = struct {
             self.setStatus("Cannot export: LOGSVC is unavailable.");
             return false;
         }
-        var query = self.makeRecordQuery();
-        query.start_index = 0;
-        var first = true;
-        var pages: u32 = 0;
-        var total_bytes: u64 = 0;
-        while (pages < 64) : (pages += 1) {
-            var page: r4os.abi.LogServiceExportPage = .{};
-            const rc = source_view.exportPage(&self.ctx.sys, &query, &page);
-            if (rc != r4os.abi.service_api_result_ok) {
-                self.setErrorStatus("Export", rc);
-                return false;
-            }
-            const len: usize = @min(@as(usize, page.bytes), page.text.len);
-            if (len > 0) {
-                const written = if (first)
-                    self.ctx.sys.fileWrite(zptr(self.export_path[0..]), page.text[0..len])
-                else
-                    self.ctx.sys.fileAppend(zptr(self.export_path[0..]), page.text[0..len]);
-                if (written != @as(i32, @intCast(len))) {
-                    self.setStatus("Export failed: file write error.");
-                    return false;
-                }
-                first = false;
-                total_bytes += len;
-            } else if (first and page.total_matches == 0) {
-                self.setStatus("No matching records to export.");
-                return false;
-            }
-            if ((page.flags & r4os.abi.log_service_page_flag_more) == 0) break;
-            if (page.next_index <= query.start_index) {
-                self.setStatus("Export failed: invalid pagination.");
-                return false;
-            }
-            query.start_index = page.next_index;
+        const allocator = self.ctx.sys.allocator();
+        const snapshot = allocator.alloc(r4os.abi.LogServiceRecord, r4os.abi.log_service_max_records) catch {
+            self.setStatus("Export failed: not enough memory.");
+            return false;
+        };
+        defer allocator.free(snapshot);
+        var revision: u32 = 0;
+        const query = self.makeRecordQuery();
+        const count = source_view.capture(&self.ctx.sys, &query, snapshot, &revision) orelse {
+            self.setStatus("Export failed: no stable log snapshot.");
+            return false;
+        };
+        if (count == 0) {
+            self.setStatus("No matching records to export.");
+            return false;
         }
-        if (pages >= 64) {
-            self.setStatus("Export stopped: too many pages.");
+        // Bounded record strings plus ample space for all numeric fields and
+        // labels. Both buffers belong to this process, never its small stack.
+        const bytes = allocator.alloc(u8, count * (@sizeOf(r4os.abi.LogServiceRecord) + 192)) catch {
+            self.setStatus("Export failed: not enough memory.");
+            return false;
+        };
+        defer allocator.free(bytes);
+        var total_bytes: usize = 0;
+        for (snapshot[0..count]) |record| {
+            const formatted = source_view.formatRecord(record, bytes[total_bytes..]) orelse {
+                self.setStatus("Export failed: record too long.");
+                return false;
+            };
+            total_bytes += formatted.len;
+        }
+        const saved = self.saver.save(.{ .sys = self.ctx.sys }, .{ .ptr = zptr(self.export_path[0..]), .len = @intCast(spanZ(self.export_path[0..]).len) }, bytes[0..total_bytes], false);
+        if (!saved.committed()) {
+            self.setStatus(saved.message());
             return false;
         }
         var line: [160]u8 = .{0} ** 160;
@@ -618,6 +621,7 @@ const App = struct {
         appendDec(line[0..], total_bytes);
         appendZ(line[0..], " bytes to ");
         appendZ(line[0..], spanZ(self.export_path[0..]));
+        if (saved == .saved_backup_retained) appendZ(line[0..], " (backup retained)");
         self.setStatus(spanZ(line[0..]));
         return true;
     }

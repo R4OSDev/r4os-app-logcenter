@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.7`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/LOGCENTER.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -12,13 +12,29 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
+## Parallel instances and export
+
+Normal background instances declare `runtime.parallel=owned-v1`. Each instance
+keeps one GUI producer and its own query, buffers and save policy. Console
+`/SOURCE=`, `/MIN=`, `/SEARCH=` and `/OUT=` selections also apply to the GUI.
+
+An export captures one complete, bounded, revision-stable non-kernel log view.
+It formats private process buffers, then publishes through the SDK atomic save
+policy. Concurrent instances cannot interleave file pages; a successful commit
+replaces the complete target. Failure does not fall back to truncating the
+published file. An unconfirmed replacement retains its complete temporary
+copies and reports that state. Kernel logs remain exclusive to Spectra.
+
+`/SELFTEST` includes a global LOGSVC stop/restart case; run it in isolation from
+other log consumers. The normal GUI/export path does not stop the service.
+
 ## Build
 
 On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
