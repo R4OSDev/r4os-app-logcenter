@@ -172,7 +172,7 @@ const App = struct {
                         },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
-                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        .key_down => self.handleKey(event.key),
                         else => {},
                     }
                 },
@@ -462,7 +462,8 @@ const App = struct {
         }
     }
 
-    fn handleKey(self: *App, key: u8) void {
+    fn handleKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (self.search_focused) {
             if (key == r4os.gui.Key.escape or key == r4os.gui.Key.tab) {
                 self.search_focused = false;
@@ -475,7 +476,7 @@ const App = struct {
                 self.render();
                 return;
             }
-            if (self.search.handleClipboardKey(&self.ctx.desk, key)) {
+            if (self.search.handleClipboardCodepoint(&self.ctx.desk, codepoint)) {
                 self.record_start = 0;
                 self.reload();
                 self.render();
