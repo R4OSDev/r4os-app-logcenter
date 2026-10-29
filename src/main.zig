@@ -170,6 +170,11 @@ const App = struct {
                             self.updateMetrics();
                             dirty = true;
                         },
+                        .input_reset, .focus_lost => {
+                            const repaint = self.mouse_down_action != null;
+                            self.mouse_down_action = null;
+                            if (repaint) self.render();
+                        },
                         .mouse_down => self.handleMouseDown(event.x, event.y),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
                         .key_down => self.handleKey(event.key),
