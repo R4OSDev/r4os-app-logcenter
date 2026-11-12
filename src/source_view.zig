@@ -11,6 +11,92 @@ const sources = [_]u32{
 };
 var records: [abi.log_service_max_records]abi.LogServiceRecord = undefined;
 
+/// A complete view borrows one endpoint and one deadline. A replacement
+/// service cannot supply the remaining pages of an older observation.
+pub const Client = struct {
+    connection: r4os.ServiceConnection,
+    operation: r4os.rpc_budget.Budget,
+    last_error: ?i32 = null,
+
+    pub fn open(sys: r4os.r4sys.Context) union(enum) { client: Client, failure: i32 } {
+        const services = r4os.Services{ .sys = sys };
+        var connection = switch (services.open(abi.log_r4x_service_name)) {
+            .connection => |value| value,
+            .failure => |raw| return .{ .failure = raw },
+        };
+        const operation = connection.budget(r4os.time_contract.timeoutFinite(.{ .nanoseconds = 5_000_000_000 })) catch |err| {
+            _ = connection.close();
+            return .{ .failure = r4os.rpc_budget.code(err) };
+        };
+        return .{ .client = .{ .connection = connection, .operation = operation } };
+    }
+
+    pub fn close(self: *Client) i32 {
+        return self.connection.close();
+    }
+
+    fn request(self: *Client, comptime Response: type, op: u16, bytes: []const u8, out: *Response, magic: u32) i32 {
+        const rc = switch (self.connection.callBudget(op, bytes, std.mem.asBytes(out), &self.operation)) {
+            .response => |response| if (response.bytes == @sizeOf(Response) and out.magic == magic and out.version == abi.log_service_version)
+                abi.service_api_result_ok
+            else
+                abi.service_api_result_invalid,
+            .failure, .remote_failure => |raw| raw,
+            .timed_out => abi.service_api_result_timeout,
+        };
+        if (rc != abi.service_api_result_ok) self.last_error = rc;
+        return rc;
+    }
+
+    pub fn logServiceStatus(self: *Client, out: *abi.LogServiceStatus) i32 {
+        return self.request(abi.LogServiceStatus, abi.log_service_op_status, "", out, abi.log_service_status_magic);
+    }
+
+    pub fn logServiceSources(self: *Client, query: *const abi.LogServiceSourceQuery, out: *abi.LogServiceSourcePage) i32 {
+        return self.request(abi.LogServiceSourcePage, abi.log_service_op_sources, std.mem.asBytes(query), out, abi.log_service_source_page_magic);
+    }
+
+    pub fn logServiceRecords(self: *Client, query: *const abi.LogServiceRecordQuery, out: *abi.LogServiceRecordPage) i32 {
+        return self.request(abi.LogServiceRecordPage, abi.log_service_op_records, std.mem.asBytes(query), out, abi.log_service_record_page_magic);
+    }
+};
+
+pub fn captureSources(sys: anytype, storage: []abi.LogServiceSourceInfo, revision_out: *u32) ?usize {
+    var query: abi.LogServiceSourceQuery = .{};
+    var count: usize = 0;
+    var revision: ?u32 = null;
+    var total: ?u32 = null;
+    while (true) {
+        var page: abi.LogServiceSourcePage = .{};
+        if (sys.logServiceSources(&query, &page) != abi.service_api_result_ok) return null;
+        if (page.count > page.sources.len or page.count > storage.len - count or
+            page.start_index != query.start_index or page.total_sources > storage.len or
+            page.next_index < page.start_index or page.next_index - page.start_index != page.count or
+            page.next_index > page.total_sources or page.flags & ~abi.log_service_page_flag_more != 0) return null;
+        if (revision) |expected| {
+            if (page.revision != expected) return null;
+        } else revision = page.revision;
+        if (total) |expected| {
+            if (page.total_sources != expected) return null;
+        } else total = page.total_sources;
+        for (page.sources[0..page.count]) |source| {
+            if (source.id == abi.log_service_source_any or source.reserved0 != 0 or source.stored_records > abi.log_service_max_records or
+                std.mem.indexOfScalar(u8, &source.name, 0) == null or
+                std.mem.indexOfScalar(u8, &source.description, 0) == null) return null;
+            for (storage[0..count]) |previous| if (previous.id == source.id) return null;
+            storage[count] = source;
+            count += 1;
+        }
+        if (page.flags & abi.log_service_page_flag_more == 0) {
+            if (page.next_index != page.total_sources) return null;
+            revision_out.* = revision orelse 0;
+            return count;
+        }
+        if (page.count == 0 or page.next_index == page.total_sources) return null;
+        query.start_index = page.next_index;
+    }
+}
+
 pub fn allowed(id: u32) bool {
     for (sources) |source| if (id == source) return true;
     return false;
@@ -20,11 +106,7 @@ fn before(_: void, a: abi.LogServiceRecord, b: abi.LogServiceRecord) bool {
     return a.sequence < b.sequence;
 }
 
-pub fn read(sys: *const r4os.r4sys.Context, query: *const abi.LogServiceRecordQuery, out: *abi.LogServiceRecordPage) i32 {
-    if (query.source_id != abi.log_service_source_any) {
-        if (!allowed(query.source_id)) return -1;
-        return sys.logServiceRecords(query, out);
-    }
+pub fn read(sys: anytype, query: *const abi.LogServiceRecordQuery, out: *abi.LogServiceRecordPage) i32 {
     var revision: u32 = 0;
     const count = capture(sys, query, &records, &revision) orelse return -1;
     out.* = .{ .start_index = query.start_index, .total_matches = @intCast(count), .revision = revision };
@@ -32,7 +114,7 @@ pub fn read(sys: *const r4os.r4sys.Context, query: *const abi.LogServiceRecordQu
     const length = @min(count - start, @min(@as(usize, query.max_records), out.records.len));
     @memcpy(out.records[0..length], records[start..][0..length]);
     out.count = @intCast(length);
-    out.next_index = @intCast(start + length);
+    out.next_index = query.start_index + @as(u32, @intCast(length));
     if (start + length < count) out.flags |= abi.log_service_page_flag_more;
     return abi.service_api_result_ok;
 }
@@ -64,11 +146,17 @@ pub fn capture(sys: anytype, query: *const abi.LogServiceRecordQuery, storage: [
                 } else revision = page.revision;
                 if (page.count > page.records.len or page.count > storage.len - count) return null;
                 if (page.start_index != part.start_index or page.total_matches > abi.log_service_max_records or
-                    page.next_index != part.start_index + page.count or page.next_index > page.total_matches) return null;
+                    page.next_index < part.start_index or page.next_index - part.start_index != page.count or
+                    page.next_index > page.total_matches or page.flags & ~abi.log_service_page_flag_more != 0) return null;
                 if (source_total) |expected| {
                     if (page.total_matches != expected) return null;
                 } else source_total = page.total_matches;
-                for (page.records[0..page.count]) |record| if (record.source_id != source) return null;
+                for (page.records[0..page.count]) |record| {
+                    if (record.magic != abi.log_service_record_magic or record.version != abi.log_service_version or
+                        record.source_id != source or record.reserved0 != 0 or record.reserved1 != 0 or
+                        record.text_len >= record.text.len or record.origin_len >= record.origin.len or
+                        record.text[record.text_len] != 0 or record.origin[record.origin_len] != 0) return null;
+                }
                 @memcpy(storage[count..][0..page.count], page.records[0..page.count]);
                 count += page.count;
                 if (page.flags & abi.log_service_page_flag_more == 0) {
@@ -130,12 +218,33 @@ const ChangingService = struct {
         const start = @min(query.start_index, 40);
         const count = @min(@as(u32, out.records.len), 40 - start);
         for (out.records[0..count], 0..) |*record, i| {
-            record.* = .{ .sequence = start + i + 1, .source_id = query.source_id };
+            record.* = .{ .sequence = start + i + 1, .source_id = query.source_id, .text_len = 1 };
             record.text[0] = if (self.changed) 'B' else 'A';
         }
         out.count = count;
         out.next_index = start + count;
         if (out.next_index < 40) out.flags |= abi.log_service_page_flag_more;
+        return abi.service_api_result_ok;
+    }
+};
+
+const PagedSources = struct {
+    malformed: enum { none, revision, duplicate, oversized } = .none,
+    calls: usize = 0,
+
+    pub fn logServiceSources(self: *PagedSources, query: *const abi.LogServiceSourceQuery, out: *abi.LogServiceSourcePage) i32 {
+        self.calls += 1;
+        out.* = .{ .revision = 7, .total_sources = 8, .start_index = query.start_index };
+        out.count = 2;
+        out.next_index = query.start_index + 2;
+        if (out.next_index < 8) out.flags = abi.log_service_page_flag_more;
+        for (out.sources[0..2], 0..) |*source, i| source.id = query.start_index + @as(u32, @intCast(i)) + 1;
+        if (query.start_index != 0) switch (self.malformed) {
+            .none => {},
+            .revision => out.revision += 1,
+            .duplicate => out.sources[0].id = 1,
+            .oversized => out.count = @intCast(out.sources.len + 1),
+        };
         return abi.service_api_result_ok;
     }
 };
@@ -153,6 +262,13 @@ test "export snapshot retries all pages after a revision change" {
         try std.testing.expectEqual(@as(u8, 'B'), record.text[0]);
         try std.testing.expectEqual(abi.log_service_source_application, record.source_id);
     }
+    var source_service: PagedSources = .{};
+    var source_storage: [8]abi.LogServiceSourceInfo = undefined;
+    const source_count = captureSources(&source_service, &source_storage, &revision) orelse return error.CaptureSourcesFailed;
+    try std.testing.expectEqual(@as(usize, 8), source_count);
+    try std.testing.expectEqual(@as(usize, 4), source_service.calls);
+    try std.testing.expectEqual(@as(u32, 7), revision);
+    for (source_storage, 1..) |source, i| try std.testing.expectEqual(@as(u32, @intCast(i)), source.id);
 }
 
 test "unstable or undersized snapshot cannot publish and kernel source is refused" {
@@ -169,4 +285,11 @@ test "unstable or undersized snapshot cannot publish and kernel source is refuse
     query.source_id = abi.log_service_source_bootlog;
     try std.testing.expectEqual(@as(?usize, null), capture(&service, &query, &storage, &revision));
     try std.testing.expectEqual(calls, service.calls);
+    var source_storage: [8]abi.LogServiceSourceInfo = undefined;
+    for ([_]@FieldType(PagedSources, "malformed"){ .revision, .duplicate, .oversized }) |malformed| {
+        var source_service: PagedSources = .{ .malformed = malformed };
+        revision = 777;
+        try std.testing.expectEqual(@as(?usize, null), captureSources(&source_service, &source_storage, &revision));
+        try std.testing.expectEqual(@as(u32, 777), revision);
+    }
 }

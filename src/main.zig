@@ -1,13 +1,16 @@
 const source_view = @import("source_view.zig");
 const r4os = @import("r4os");
+const std = @import("std");
 
 const AppApi = struct {
+    app: *const r4os.App2,
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
+            .app = r4_app,
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
@@ -49,7 +52,9 @@ const Action = enum(u8) {
     severity_error,
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+const RunMode = enum { gui, export_view, rdp_trace, selftest };
+
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
     var app = App{ .ctx = &ctx };
     return app.run();
@@ -80,29 +85,27 @@ const App = struct {
     records: [r4os.abi.log_service_records_per_page]r4os.abi.LogServiceRecord = .{r4os.abi.LogServiceRecord{}} ** r4os.abi.log_service_records_per_page,
     export_path: [128]u8 = .{0} ** 128,
     saver: r4os.document_save.Saver = .{},
+    clipboard: r4os.gui.TextClipboard = .{},
 
     fn run(self: *App) i32 {
+        defer _ = self.clipboard.close();
         setZ(self.export_path[0..], default_export_path);
-        const args = trim(zSlice(self.ctx.sys.argsRaw()));
-        if (argsContain(args, "/SELFTEST") or argsContain(args, "SELFTEST")) return self.selfTest();
-        if (argsContain(args, "/RDPTRACE") or argsContain(args, "RDPTRACE")) {
+        const mode = self.applyArgs(self.ctx.app.args()) orelse return 2;
+        if (mode == .selftest) return self.selfTest();
+        if (mode == .rdp_trace) {
             self.configureRdpTraceExport();
             self.reload();
             const ok = self.exportCurrentView();
             self.printExportStatus();
             return if (ok) 0 else 1;
         }
-        if (argsContain(args, "/EXPORT") or argsContain(args, "EXPORT")) {
-            if (!self.applyConsoleExportArgs(args)) return 2;
+        if (mode == .export_view) {
             self.reload();
             const ok = self.exportCurrentView();
             self.printExportStatus();
             return if (ok) 0 else 1;
         }
         if (self.ctx.desk.programWindowId() >= 0) {
-            // The normal GUI uses the same source/filter/output selection as
-            // console export, including a caller-selected private destination.
-            if (!self.applyConsoleExportArgs(args)) return 2;
             return self.runHosted();
         }
         self.ctx.sys.println("LOGCENTER is a desktop GUI application.");
@@ -117,24 +120,50 @@ const App = struct {
         setZ(self.export_path[0..], rdp_trace_export_path);
     }
 
-    fn applyConsoleExportArgs(self: *App, args: []const u8) bool {
-        var rest = args;
-        while (takeToken(rest)) |part| {
-            if (argValue(part.token, "SOURCE")) |value| {
+    fn applyArgs(self: *App, args: []const u8) ?RunMode {
+        var failure: r4os.arguments.Failure = .{};
+        var cursor = r4os.arguments.ArgCursor.init(args, .{ .switches = r4os.arguments.slash | r4os.arguments.dash }, &failure) catch {
+            self.ctx.sys.println("LOGCENTER: invalid argument text.");
+            return null;
+        };
+        var mode: RunMode = .gui;
+        while (cursor.next() catch {
+            self.ctx.sys.println("LOGCENTER: invalid argument quoting.");
+            return null;
+        }) |token| {
+            const bytes = token.bytes(args) catch return null;
+            const name = trimArgPrefix(bytes);
+            if (sameIgnoreCase(name, "SELFTEST")) {
+                mode = .selftest;
+            } else if (sameIgnoreCase(name, "RDPTRACE")) {
+                if (mode != .selftest) mode = .rdp_trace;
+            } else if (sameIgnoreCase(name, "EXPORT")) {
+                if (mode == .gui) mode = .export_view;
+            } else if (argValue(bytes, "SOURCE")) |value| {
                 self.selected_source_id = sourceIdFromArg(value) orelse {
                     self.ctx.sys.println("LOGCENTER: unknown source; kernel logs use SPECTRA LOGS.");
-                    return false;
+                    return null;
                 };
-            } else if (argValue(part.token, "MIN")) |value| {
-                if (severityFromArg(value)) |severity| self.severity_min = severity;
-            } else if (argValue(part.token, "SEARCH")) |value| {
+            } else if (argValue(bytes, "MIN")) |value| {
+                self.severity_min = severityFromArg(value) orelse {
+                    self.ctx.sys.println("LOGCENTER: unknown minimum severity.");
+                    return null;
+                };
+            } else if (argValue(bytes, "SEARCH")) |value| {
+                if (value.len >= self.search.buffer.len) {
+                    self.ctx.sys.println("LOGCENTER: search exceeds the search capacity.");
+                    return null;
+                }
                 self.search.set(value);
-            } else if (argValue(part.token, "OUT")) |value| {
+            } else if (argValue(bytes, "OUT")) |value| {
+                if (value.len >= self.export_path.len) {
+                    self.ctx.sys.println("LOGCENTER: output path exceeds the path capacity.");
+                    return null;
+                }
                 if (value.len != 0) setZ(self.export_path[0..], value);
             }
-            rest = part.rest;
         }
-        return true;
+        return mode;
     }
 
     fn printExportStatus(self: *App) void {
@@ -166,7 +195,7 @@ const App = struct {
                     const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
                     switch (kind) {
                         .close => return 0,
-                        .resize => {
+                        .resize, .font_changed => {
                             self.updateMetrics();
                             dirty = true;
                         },
@@ -205,64 +234,66 @@ const App = struct {
         self.next_index = 0;
         self.has_more = false;
 
-        var status: r4os.abi.LogServiceStatus = .{};
-        const status_rc = self.ctx.sys.logServiceStatus(&status);
-        if (status_rc != r4os.abi.service_api_result_ok) {
-            self.setUnavailableStatus(status_rc);
+        var client = switch (source_view.Client.open(self.ctx.sys)) {
+            .client => |value| value,
+            .failure => |raw| {
+                self.setUnavailableStatus(raw);
+                return;
+            },
+        };
+        defer _ = client.close();
+        for (0..3) |_| {
+            var status: r4os.abi.LogServiceStatus = .{};
+            const status_rc = client.logServiceStatus(&status);
+            if (status_rc != r4os.abi.service_api_result_ok) {
+                self.setUnavailableStatus(status_rc);
+                return;
+            }
+            var candidates: [r4os.abi.log_service_source_count]r4os.abi.LogServiceSourceInfo = undefined;
+            var source_revision: u32 = 0;
+            const count = source_view.captureSources(&client, &candidates, &source_revision) orelse continue;
+            var query = self.makeRecordQuery();
+            var page: r4os.abi.LogServiceRecordPage = .{};
+            if (source_view.read(&client, &query, &page) != r4os.abi.service_api_result_ok) continue;
+            if (page.count == 0 and self.record_start > 0) {
+                query.start_index = 0;
+                if (source_view.read(&client, &query, &page) != r4os.abi.service_api_result_ok) continue;
+            }
+            var after: r4os.abi.LogServiceStatus = .{};
+            if (client.logServiceStatus(&after) != r4os.abi.service_api_result_ok) break;
+            if (status.revision != source_revision or page.revision != source_revision or after.revision != source_revision) continue;
+            self.service_status = after;
+            self.service_status.record_count = 0;
+            self.service_status.total_records = 0;
+            self.service_status.dropped_records = 0;
+            for (candidates[0..count]) |source| {
+                if (!source_view.allowed(source.id)) continue;
+                if (self.source_count == self.sources.len) {
+                    self.setErrorStatus("Source capacity", r4os.abi.service_api_result_buffer_too_small);
+                    return;
+                }
+                self.sources[self.source_count] = source;
+                self.source_count += 1;
+                self.service_status.record_count += source.stored_records;
+                self.service_status.total_records += source.total_records;
+                self.service_status.dropped_records += source.dropped_records;
+            }
+            self.record_start = query.start_index;
+            self.record_count = page.count;
+            self.total_matches = page.total_matches;
+            self.next_index = page.next_index;
+            self.has_more = page.flags & r4os.abi.log_service_page_flag_more != 0;
+            @memcpy(self.records[0..self.record_count], page.records[0..self.record_count]);
+            self.selected_record = if (self.record_count == 0) 0 else @min(self.selected_record, self.record_count - 1);
+            self.service_available = true;
+            self.setReadyStatus();
             return;
         }
-        self.service_available = true;
-        self.service_status = status;
-
-        var source_query = r4os.abi.LogServiceSourceQuery{};
-        source_query.max_sources = r4os.abi.log_service_sources_per_page;
-        var source_page: r4os.abi.LogServiceSourcePage = .{};
-        const source_rc = self.ctx.sys.logServiceSources(&source_query, &source_page);
-        if (source_rc != r4os.abi.service_api_result_ok) {
-            self.setErrorStatus("Source query", source_rc);
-            return;
+        if (client.last_error) |raw| {
+            self.setErrorStatus("Complete log snapshot", raw);
+        } else {
+            self.setStatus("Log snapshot changed or invalid. Refresh to retry.");
         }
-        self.source_count = 0;
-        self.service_status.record_count = 0;
-        self.service_status.total_records = 0;
-        self.service_status.dropped_records = 0;
-        for (source_page.sources[0..@min(@as(usize, source_page.count), source_page.sources.len)]) |source| {
-            if (!source_view.allowed(source.id)) continue;
-            self.sources[self.source_count] = source;
-            self.source_count += 1;
-            self.service_status.record_count += source.stored_records;
-            self.service_status.total_records += source.total_records;
-            self.service_status.dropped_records += source.dropped_records;
-        }
-
-        if (self.loadRecords() != r4os.abi.service_api_result_ok) return;
-        if (self.record_count == 0 and self.record_start > 0) {
-            self.record_start = 0;
-            _ = self.loadRecords();
-        }
-        if (self.record_count == 0) {
-            self.selected_record = 0;
-        } else if (self.selected_record >= self.record_count) {
-            self.selected_record = self.record_count - 1;
-        }
-        self.setReadyStatus();
-    }
-
-    fn loadRecords(self: *App) i32 {
-        var query = self.makeRecordQuery();
-        var page: r4os.abi.LogServiceRecordPage = .{};
-        const rc = source_view.read(&self.ctx.sys, &query, &page);
-        if (rc != r4os.abi.service_api_result_ok) {
-            self.setErrorStatus("Record query", rc);
-            return rc;
-        }
-        self.record_count = @min(@as(usize, page.count), self.records.len);
-        self.total_matches = page.total_matches;
-        self.next_index = page.next_index;
-        self.has_more = (page.flags & r4os.abi.log_service_page_flag_more) != 0;
-        var i: usize = 0;
-        while (i < self.record_count) : (i += 1) self.records[i] = page.records[i];
-        return r4os.abi.service_api_result_ok;
     }
 
     fn makeRecordQuery(self: *const App) r4os.abi.LogServiceRecordQuery {
@@ -467,6 +498,53 @@ const App = struct {
         }
     }
 
+    fn handleSearchKey(self: *App, codepoint: u32) bool {
+        if (codepoint != r4os.gui.Key.ctrl_c and codepoint != r4os.gui.Key.ctrl_x and codepoint != r4os.gui.Key.ctrl_v)
+            return self.search.handleCodepointChecked(codepoint);
+        const connected = self.clipboard.connect(&self.ctx.sys);
+        if (connected != 0) {
+            self.setErrorStatus("Clipboard", connected);
+            self.render();
+            return false;
+        }
+        const range = self.search.selectionRange();
+        if (codepoint == r4os.gui.Key.ctrl_c or codepoint == r4os.gui.Key.ctrl_x) {
+            const selected = if (self.search.hasSelection()) self.search.value()[range.start..range.end] else self.search.value();
+            const copied = self.clipboard.copy(selected);
+            if (copied != 0) {
+                self.setErrorStatus("Clipboard", copied);
+                self.render();
+                return false;
+            }
+            if (codepoint == r4os.gui.Key.ctrl_c) return false;
+            if (self.search.hasSelection()) return self.search.handleKey(r4os.gui.Key.delete);
+            self.search.clear();
+            return true;
+        }
+        var scratch: [r4os.abi.log_service_search_bytes]u8 = undefined;
+        const result = self.clipboard.read(&scratch);
+        if (result < 0) {
+            self.setErrorStatus("Clipboard", result);
+            self.render();
+            return false;
+        }
+        const count: usize = @intCast(result);
+        const capacity = self.search.buffer.len - 1 - self.search.len + range.end - range.start;
+        if (count > capacity) {
+            self.setStatus("Clipboard search text exceeds the search capacity.");
+            self.render();
+            return false;
+        }
+        for (scratch[0..count]) |byte| {
+            if (byte < 0x20 or byte == 0x7f) {
+                self.setStatus("Clipboard search text contains a control character.");
+                self.render();
+                return false;
+            }
+        }
+        return self.search.pasteSlice(scratch[0..count]);
+    }
+
     fn handleKey(self: *App, codepoint: u32) void {
         const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (self.search_focused) {
@@ -481,14 +559,14 @@ const App = struct {
                 self.render();
                 return;
             }
-            if (self.search.handleClipboardCodepoint(&self.ctx.desk, codepoint)) {
+            if (self.handleSearchKey(codepoint)) {
                 self.record_start = 0;
                 self.reload();
                 self.render();
             }
             return;
         }
-        switch (key) {
+        switch (codepoint) {
             r4os.gui.Key.escape => self.should_exit = true,
             r4os.gui.Key.tab => {
                 self.search_focused = true;
@@ -594,7 +672,15 @@ const App = struct {
         defer allocator.free(snapshot);
         var revision: u32 = 0;
         const query = self.makeRecordQuery();
-        const count = source_view.capture(&self.ctx.sys, &query, snapshot, &revision) orelse {
+        var client = switch (source_view.Client.open(self.ctx.sys)) {
+            .client => |value| value,
+            .failure => |raw| {
+                self.setErrorStatus("Export endpoint", raw);
+                return false;
+            },
+        };
+        defer _ = client.close();
+        const count = source_view.capture(&client, &query, snapshot, &revision) orelse {
             self.setStatus("Export failed: no stable log snapshot.");
             return false;
         };
@@ -727,7 +813,12 @@ const App = struct {
             .max_records = r4os.abi.log_service_records_per_page,
         };
         var page: r4os.abi.LogServiceRecordPage = .{};
-        return source_view.read(&self.ctx.sys, &query, &page) == r4os.abi.service_api_result_ok and page.total_matches > 0;
+        var client = switch (source_view.Client.open(self.ctx.sys)) {
+            .client => |value| value,
+            .failure => return false,
+        };
+        defer _ = client.close();
+        return source_view.read(&client, &query, &page) == r4os.abi.service_api_result_ok and page.total_matches > 0;
     }
 
     fn fail(self: *App, label: []const u8) i32 {
@@ -750,11 +841,9 @@ const App = struct {
     }
 
     fn setErrorStatus(self: *App, label: []const u8, rc: i32) void {
-        var line: [160]u8 = .{0} ** 160;
-        setZ(line[0..], label);
-        appendZ(line[0..], " failed: ");
-        appendZ(line[0..], resultName(rc));
-        self.setStatus(spanZ(line[0..]));
+        var line: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&line, "{s} failed: {s} ({d})", .{ label, resultName(rc), rc }) catch "Log operation failed";
+        self.setStatus(message);
     }
 
     fn setReadyStatus(self: *App) void {
@@ -977,7 +1066,7 @@ fn resultName(rc: i32) []const u8 {
         r4os.abi.service_api_result_disabled => "disabled",
         r4os.abi.service_api_result_spawn_failed => "spawn-failed",
         r4os.abi.service_api_result_stop_failed => "stop-failed",
-        else => "invalid",
+        else => "unknown",
     };
 }
 
@@ -1041,36 +1130,6 @@ fn zSlice(ptr: [*:0]const u8) []const u8 {
 
 fn zptr(buffer: []const u8) [*:0]const u8 {
     return @ptrCast(buffer.ptr);
-}
-
-fn trim(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end = s.len;
-    while (start < end and (s[start] == ' ' or s[start] == '\t' or s[start] == '\r' or s[start] == '\n')) : (start += 1) {}
-    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t' or s[end - 1] == '\r' or s[end - 1] == '\n')) : (end -= 1) {}
-    return s[start..end];
-}
-
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
-fn takeToken(s_raw: []const u8) ?Token {
-    const s = trim(s_raw);
-    if (s.len == 0) return null;
-    var end: usize = 0;
-    while (end < s.len and s[end] != ' ' and s[end] != '\t') : (end += 1) {}
-    return .{ .token = s[0..end], .rest = trim(s[end..]) };
-}
-
-fn argsContain(args: []const u8, wanted: []const u8) bool {
-    var rest = args;
-    while (takeToken(rest)) |part| {
-        if (sameIgnoreCase(trimArgPrefix(part.token), trimArgPrefix(wanted))) return true;
-        rest = part.rest;
-    }
-    return false;
 }
 
 fn argValue(token: []const u8, name: []const u8) ?[]const u8 {
