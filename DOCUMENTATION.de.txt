@@ -21,7 +21,7 @@ Ergebnis:
 Contract:
 - App-Entry: `r4_app_main` (`ENTRY_MODE=app`)
 - App-Klasse: `gui`
-- Platform-Imports: `R4DESK:Query:1`, `R4DRAW:Query:1`, `R4SYS:Query:1`
+- Platform-Imports: `R4DESK:Query2:2`, `R4DRAW:Query2:2`, `R4SYS:Query2:2`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\LOGCENTER.R4X`
 
 Console-Export:
